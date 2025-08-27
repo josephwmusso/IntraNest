@@ -1,0 +1,16 @@
+name: Sanity checks
+on: [pull_request]
+jobs:
+  no-vendor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fail if vendored/build artifacts are tracked
+        run: |
+          set -e
+          BAD=$(git ls-files | grep -E '/(node_modules|\.next|dist|build|\.turbo|coverage|venv|\.venv|logs|weaviate_data|mongodb_data|redis_data)/' || true)
+          if [ -n "$BAD" ]; then
+            echo "❌ Vendored/build artifacts detected in tracked files:"
+            echo "$BAD"
+            exit 1
+          fi

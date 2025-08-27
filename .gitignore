@@ -48,3 +48,73 @@ test_*
 # Setup scripts with potential config
 setup_*.py
 restore_*.py
+# --- reinforced ignores ---
+# Node/JS
+**/node_modules/
+**/.next/
+**/dist/
+**/build/
+**/.turbo/
+**/.cache/
+**/coverage/
+# Python
+**/__pycache__/
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+backend/venv/
+.venv/ venv/ env/
+# Logs & data
+*.log
+logs/
+weaviate_data/
+mongodb_data/
+redis_data/
+# Secrets/env
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+# Backups, debug, tests
+*backup* *_backup* *.bak
+debug_* test_* *_test.py *_debug.py
+# OS cruft
+.DS_Store
+Thumbs.db
+# --- reinforced ignores ---
+# Node/JS
+**/node_modules/
+**/.next/
+**/dist/
+**/build/
+**/.turbo/
+**/.cache/
+**/coverage/
+# Python
+**/__pycache__/
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+backend/venv/
+.venv/ venv/ env/
+# Logs & data
+*.log
+logs/
+weaviate_data/
+mongodb_data/
+redis_data/
+# Secrets/env
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+# Backups, debug, tests
+*backup* *_backup* *.bak
+debug_* test_* *_test.py *_debug.py
+# OS cruft
+.DS_Store
+Thumbs.db

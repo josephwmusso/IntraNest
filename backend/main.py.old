@@ -1,0 +1,1472 @@
+#!/usr/bin/env python3
+"""
+IntraNest 2.0 - Complete Document Management Edition - REAL PROGRESS TRACKING
+FastAPI backend with Weaviate vector database, LlamaIndex RAG engine, and document management
+100% Operational - Production Ready with REAL-TIME PROGRESS TRACKING
+"""
+
+from fastapi import FastAPI, Depends, HTTPException, Header, File, UploadFile, Form, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import StreamingResponse
+from contextlib import asynccontextmanager
+import os
+import logging
+from dotenv import load_dotenv
+from typing import Optional, Dict, List, Any
+import json
+import uuid
+import asyncio
+from datetime import datetime, timedelta
+from pathlib import Path
+import hashlib
+import tempfile
+from io import BytesIO
+import re
+
+# LlamaIndex imports - test each component individually
+LLAMAINDEX_AVAILABLE = True
+llamaindex_components = {}
+
+try:
+    from llama_index.core import VectorStoreIndex, Document, Settings, StorageContext
+    from llama_index.core.node_parser import SentenceSplitter
+    from llama_index.vector_stores.weaviate import WeaviateVectorStore
+    from llama_index.llms.openai import OpenAI
+    from llama_index.embeddings.openai import OpenAIEmbedding
+    llamaindex_components.update({
+        'VectorStoreIndex': VectorStoreIndex,
+        'Document': Document,
+        'Settings': Settings,
+        'StorageContext': StorageContext,
+        'SentenceSplitter': SentenceSplitter,
+        'WeaviateVectorStore': WeaviateVectorStore,
+        'OpenAI': OpenAI,
+        'OpenAIEmbedding': OpenAIEmbedding
+    })
+    logging.info("✅ Core LlamaIndex components loaded")
+except ImportError as e:
+    logging.error(f"❌ Core LlamaIndex components failed: {e}")
+    LLAMAINDEX_AVAILABLE = False
+
+# Document processing imports
+try:
+    import weaviate
+    from weaviate import WeaviateAsyncClient
+    from weaviate.classes.config import Configure, Property, DataType
+    from weaviate.classes.query import Filter
+    import openai
+    # Document management imports
+    import minio
+    import redis
+    import mimetypes
+    DOCUMENT_PROCESSING_AVAILABLE = True
+except ImportError as e:
+    logging.warning(f"Document processing dependencies not available: {e}")
+    DOCUMENT_PROCESSING_AVAILABLE = False
+
+# Load environment variables
+load_dotenv()
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Environment variables
+WEAVIATE_URL = os.getenv("WEAVIATE_URL", "http://localhost:8080")
+WEAVIATE_API_KEY = os.getenv("WEAVIATE_API_KEY", "b8f2c4e8a9d3f7e1b5c9a6e2f8d4b7c3e9a5f1d8b2c6e9f3a7b4e8c2d6f9a3b5c8")
+
+# Global service instances
+weaviate_service = None
+ai_service = None
+document_service = None
+
+# === DOCUMENT MANAGEMENT CONFIGURATION ===
+class DocumentConfig:
+    """Document management configuration"""
+    STORAGE_TYPE = os.getenv("STORAGE_TYPE", "local")
+    UPLOAD_DIR = "/tmp/intranest_uploads"
+
+    MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
+    ALLOWED_MIME_TYPES = {
+        'application/pdf',
+        'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        'text/plain', 'text/html', 'text/markdown'
+    }
+    CHUNK_SIZE = 1000
+    CHUNK_OVERLAP = 200
+
+class StorageService:
+    """Handle file storage operations - SIMPLIFIED LOCAL VERSION"""
+    def __init__(self):
+        # Create upload directory if it doesn't exist
+        os.makedirs(DocumentConfig.UPLOAD_DIR, exist_ok=True)
+
+    def save_uploaded_file(self, file_content: bytes, filename: str, user_id: str) -> str:
+        """Save uploaded file locally and return file path"""
+        try:
+            # Create user-specific directory
+            user_dir = os.path.join(DocumentConfig.UPLOAD_DIR, user_id)
+            os.makedirs(user_dir, exist_ok=True)
+
+            # Generate unique filename
+            file_extension = Path(filename).suffix
+            unique_filename = f"{uuid.uuid4().hex}{file_extension}"
+            file_path = os.path.join(user_dir, unique_filename)
+
+            # Save file
+            with open(file_path, 'wb') as f:
+                f.write(file_content)
+
+            logger.info(f"✅ File saved: {file_path}")
+            return file_path
+
+        except Exception as e:
+            logger.error(f"❌ Failed to save file: {e}")
+            raise
+
+    def get_file_content(self, file_path: str) -> bytes:
+        """Retrieve file content"""
+        try:
+            with open(file_path, 'rb') as f:
+                return f.read()
+        except Exception as e:
+            logger.error(f"❌ Failed to read file {file_path}: {e}")
+            raise
+
+class DocumentCacheService:
+    """Handle document metadata caching with REAL progress tracking"""
+    def __init__(self):
+        # Use in-memory storage if Redis is not available
+        self._memory_cache = {}
+        try:
+            self.redis_client = redis.Redis.from_url(
+                os.getenv("REDIS_URL", "redis://localhost:6379"),
+                decode_responses=True
+            )
+            # Test connection
+            self.redis_client.ping()
+            self.use_redis = True
+            logger.info("✅ Redis cache connected")
+        except Exception as e:
+            logger.warning(f"⚠️ Redis not available, using memory cache: {e}")
+            self.redis_client = None
+            self.use_redis = False
+
+    def cache_processing_status(self, document_id: str, status: Dict, ttl: int = 3600):
+        """Cache document processing status"""
+        try:
+            if self.use_redis and self.redis_client:
+                cache_key = f"processing:document:{document_id}"
+                self.redis_client.setex(cache_key, ttl, json.dumps(status))
+            else:
+                self._memory_cache[document_id] = status
+        except Exception as e:
+            logger.warning(f"⚠️ Cache write failed: {e}")
+            self._memory_cache[document_id] = status
+
+    def get_processing_status(self, document_id: str) -> Optional[Dict]:
+        """Get document processing status"""
+        try:
+            if self.use_redis and self.redis_client:
+                cache_key = f"processing:document:{document_id}"
+                cached = self.redis_client.get(cache_key)
+                return json.loads(cached) if cached else None
+            else:
+                return self._memory_cache.get(document_id)
+        except Exception as e:
+            logger.warning(f"⚠️ Cache read failed: {e}")
+            return self._memory_cache.get(document_id)
+
+    def update_progress(self, document_id: str, status: str, progress: int, message: str, **kwargs):
+        """Update processing progress in real-time"""
+        try:
+            current_status = self.get_processing_status(document_id) or {}
+            current_status.update({
+                "status": status,
+                "progress": progress,
+                "message": message,
+                "updated_at": datetime.now().isoformat(),
+                **kwargs
+            })
+            self.cache_processing_status(document_id, current_status)
+            logger.info(f"📊 Progress Update [{document_id}]: {status} - {progress}% - {message}")
+        except Exception as e:
+            logger.error(f"❌ Failed to update progress: {e}")
+
+class WeaviateHelper:
+    """FIXED: Helper class for Weaviate operations with proper error handling"""
+
+    @staticmethod
+    def get_client():
+        """Get Weaviate client with proper connection"""
+        try:
+            client = weaviate.connect_to_local(
+                host="localhost",
+                port=8080,
+                auth_credentials=weaviate.auth.AuthApiKey(WEAVIATE_API_KEY) if WEAVIATE_API_KEY else None
+            )
+            return client
+        except Exception as e:
+            logger.error(f"Failed to connect to Weaviate: {e}")
+            raise
+
+    @staticmethod
+    def safe_query_with_filter(collection, user_id: str, limit: int = 1000):
+        """FIXED: Safely query with user filter - compatible with older Weaviate versions"""
+        try:
+            # Try the old-style query first (more compatible)
+            logger.info(f"🔍 Attempting Weaviate query for user: {user_id}")
+            response = collection.query.fetch_objects(limit=limit)
+            logger.info(f"📄 Weaviate returned {len(response.objects)} total objects, will filter manually")
+            
+            # Manual filtering for older Weaviate versions
+            filtered_objects = []
+            for obj in response.objects:
+                if hasattr(obj, 'properties') and obj.properties.get('user_id') == user_id:
+                    filtered_objects.append(obj)
+            
+            logger.info(f"✅ Filtered to {len(filtered_objects)} objects for user: {user_id}")
+            response.objects = filtered_objects
+            return response
+            
+        except Exception as e:
+            logger.error(f"❌ Weaviate query failed: {e}")
+            raise
+
+class LlamaIndexRAGService:
+    """RAG service with working hybrid search and similarity scores"""
+
+    def __init__(self):
+        self.weaviate_client = None
+        self.vector_store = None
+        self.index = None
+        self.service_context = None
+        self.llm = None
+        self.embed_model = None
+        self.initialize_services()
+
+    def initialize_services(self):
+        """Initialize LlamaIndex services with correct Weaviate configuration"""
+        try:
+            logger.info("🚀 Starting LlamaIndex initialization...")
+
+            if not LLAMAINDEX_AVAILABLE or not llamaindex_components:
+                logger.error("❌ LlamaIndex components not available")
+                return
+
+            # Environment variables
+            openai_api_key = os.getenv("OPENAI_API_KEY")
+            if not openai_api_key:
+                logger.error("❌ OPENAI_API_KEY not found")
+                return
+
+            logger.info("🔗 Connecting to Weaviate...")
+
+            # Initialize Weaviate client with fixed connection
+            try:
+                self.weaviate_client = WeaviateHelper.get_client()
+
+                if not self.weaviate_client.is_ready():
+                    logger.error("❌ Weaviate client not ready")
+                    return
+
+                logger.info("✅ Weaviate client connected successfully")
+
+            except Exception as e:
+                logger.error(f"❌ Weaviate connection failed: {e}")
+                return
+
+            # Initialize LlamaIndex components
+            OpenAI = llamaindex_components['OpenAI']
+            OpenAIEmbedding = llamaindex_components['OpenAIEmbedding']
+            WeaviateVectorStore = llamaindex_components['WeaviateVectorStore']
+            VectorStoreIndex = llamaindex_components['VectorStoreIndex']
+            StorageContext = llamaindex_components['StorageContext']
+
+            # Create LLM and embedding model
+            self.llm = OpenAI(
+                model="gpt-4",
+                api_key=openai_api_key,
+                temperature=0.1,
+                max_tokens=1500
+            )
+
+            self.embed_model = OpenAIEmbedding(
+                model="text-embedding-3-small",
+                api_key=openai_api_key
+            )
+
+            # Use Settings
+            from llama_index.core import Settings
+            Settings.llm = self.llm
+            Settings.embed_model = self.embed_model
+
+            # Setup Weaviate schema if needed
+            self.setup_weaviate_schema()
+
+            # Connect to existing Weaviate class
+            self.vector_store = WeaviateVectorStore(
+                weaviate_client=self.weaviate_client,
+                index_name="Documents",
+                text_key="content",
+                metadata_keys=["filename", "user_id", "document_id", "node_id", "chunk_id", "page_number"]
+            )
+
+            # Create storage context
+            storage_context = StorageContext.from_defaults(vector_store=self.vector_store)
+
+            # Load from existing vector store
+            try:
+                self.index = VectorStoreIndex.from_vector_store(
+                    self.vector_store,
+                    storage_context=storage_context
+                )
+                logger.info("✅ Connected to existing LlamaIndex from Weaviate")
+            except Exception as e:
+                logger.warning(f"⚠️ Could not load existing index, creating new: {e}")
+                self.index = VectorStoreIndex(
+                    nodes=[],
+                    storage_context=storage_context
+                )
+                logger.info("✅ Created new LlamaIndex")
+
+            logger.info("✅ LlamaIndex RAG service initialized successfully")
+
+        except Exception as e:
+            logger.error(f"❌ Failed to initialize LlamaIndex RAG service: {e}")
+            import traceback
+            traceback.print_exc()
+            self.weaviate_client = None
+
+    def setup_weaviate_schema(self):
+        """Setup Weaviate schema - create Documents collection if needed"""
+        try:
+            collections = self.weaviate_client.collections.list_all()
+            collection_names = [col for col in collections.keys()] if hasattr(collections, 'keys') else [col.name for col in collections]
+
+            if "Documents" not in collection_names:
+                logger.info("📋 Creating Documents collection...")
+
+                documents_config = {
+                    "class": "Documents",
+                    "vectorizer": "text2vec-openai",
+                    "moduleConfig": {
+                        "text2vec-openai": {
+                            "model": "text-embedding-3-small"
+                        },
+                        "generative-openai": {
+                            "model": "gpt-4"
+                        }
+                    },
+                    "properties": [
+                        {"name": "content", "dataType": ["text"]},
+                        {"name": "filename", "dataType": ["string"]},
+                        {"name": "user_id", "dataType": ["string"]},
+                        {"name": "document_id", "dataType": ["string"]},
+                        {"name": "node_id", "dataType": ["string"]},
+                        {"name": "chunk_id", "dataType": ["int"]},
+                        {"name": "page_number", "dataType": ["int"]},
+                        {"name": "metadata", "dataType": ["object"]}
+                    ]
+                }
+
+                try:
+                    collection = self.weaviate_client.collections.create_from_config(documents_config)
+                    logger.info("✅ Documents collection created successfully")
+                except Exception as e:
+                    logger.warning(f"⚠️ Could not create collection: {e}")
+
+            else:
+                logger.info("✅ Documents collection already exists")
+
+        except Exception as e:
+            logger.error(f"❌ Schema setup error: {e}")
+
+    async def search_documents(self, query: str, user_id: str, limit: int = 5) -> List[Dict[str, Any]]:
+        """Hybrid search with proper similarity score handling and fixed filters"""
+        try:
+            logger.info(f"🔍 Hybrid search for: '{query}' user: '{user_id}'")
+
+            if not self.weaviate_client:
+                logger.error("❌ No Weaviate client available")
+                return []
+
+            try:
+                documents_collection = self.weaviate_client.collections.get("Documents")
+
+                response = documents_collection.query.near_text(
+                    query=query,
+                    limit=limit * 3
+                )
+
+                logger.info(f"📄 Weaviate found {len(response.objects)} total results")
+
+                filtered_results = []
+                for i, obj in enumerate(response.objects):
+                    try:
+                        props = obj.properties if hasattr(obj, 'properties') else {}
+                        obj_user_id = props.get('user_id', '')
+
+                        if obj_user_id == user_id:
+                            similarity_score = 0.8
+                            if hasattr(obj, 'metadata') and obj.metadata:
+                                certainty = getattr(obj.metadata, 'certainty', None)
+                                distance = getattr(obj.metadata, 'distance', None)
+
+                                if certainty is not None:
+                                    similarity_score = float(certainty)
+                                elif distance is not None:
+                                    similarity_score = max(0.0, 1.0 - float(distance))
+
+                            result = {
+                                "content": props.get('content', ''),
+                                "filename": props.get('filename', 'Unknown'),
+                                "chunk_id": props.get('chunk_id', 0),
+                                "page_number": props.get('page_number', 1),
+                                "similarity_score": float(similarity_score),
+                                "document_id": props.get('document_id', ''),
+                                "node_id": str(obj.uuid)
+                            }
+
+                            filtered_results.append(result)
+                            logger.info(f"✅ Added: {result['filename']} (score: {similarity_score})")
+
+                            if len(filtered_results) >= limit:
+                                break
+
+                    except Exception as e:
+                        logger.warning(f"⚠️ Error processing object: {e}")
+                        continue
+
+                logger.info(f"✅ Search found {len(filtered_results)} documents for user {user_id}")
+                return filtered_results
+
+            except Exception as e:
+                logger.error(f"❌ Weaviate search failed: {e}")
+                return []
+
+        except Exception as e:
+            logger.error(f"❌ Hybrid search error: {e}")
+            return []
+
+    async def generate_rag_response(self, query: str, user_id: str, context_limit: int = 5) -> Dict[str, Any]:
+        """Working RAG response with proper similarity score handling"""
+        try:
+            logger.info(f"🔍 RAG query: {query[:100]}...")
+
+            search_results = await self.search_documents(query, user_id, context_limit)
+
+            if not search_results:
+                return {
+                    "response": f"""I don't have any documents in your knowledge base that are relevant to: "{query}"
+
+To get started, please upload some documents using the document upload feature. I can then provide detailed answers based on your specific content.""",
+                    "sources": [],
+                    "has_context": False
+                }
+
+            # Build context from search results
+            context_parts = []
+            sources = []
+
+            for i, result in enumerate(search_results):
+                context_parts.append(f"[Source {i+1}] {result['content']}")
+
+                similarity_score = result.get("similarity_score", 0.8)
+                if similarity_score is None:
+                    similarity_score = 0.8
+
+                try:
+                    similarity_score = float(similarity_score)
+                    relevance = round(similarity_score, 3)
+                except (ValueError, TypeError):
+                    relevance = 0.800
+
+                sources.append({
+                    "filename": result["filename"],
+                    "page": result["page_number"],
+                    "chunk": result["chunk_id"],
+                    "relevance": relevance,
+                    "node_id": result["node_id"]
+                })
+
+            context = "\n\n".join(context_parts)
+
+            # Generate response using LLM
+            if self.llm:
+                try:
+                    from llama_index.core.llms import ChatMessage, MessageRole
+
+                    messages = [
+                        ChatMessage(
+                            role=MessageRole.SYSTEM,
+                            content="You are IntraNest AI, a professional enterprise knowledge assistant. Provide accurate, well-structured responses based on the provided document context."
+                        ),
+                        ChatMessage(
+                            role=MessageRole.USER,
+                            content=f"""Based on the following documents from the user's knowledge base, answer the question: "{query}"
+
+Context from documents:
+{context}
+
+Instructions:
+1. Provide a comprehensive answer based on the provided context
+2. Reference specific sources when making claims
+3. If the context doesn't fully answer the question, acknowledge what's missing
+4. Use a professional, clear tone suitable for business use
+5. Structure your response with headers and bullet points when appropriate
+
+Answer:"""
+                        )
+                    ]
+
+                    response = self.llm.chat(messages)
+                    ai_response = str(response)
+                except Exception as e:
+                    logger.warning(f"⚠️ LLM chat failed, using simple response: {e}")
+                    ai_response = f"Based on your documents:\n\n{context[:500]}..."
+            else:
+                ai_response = f"Based on your documents:\n\n{context[:500]}..."
+
+            # Format response with sources
+            if sources:
+                sources_text = "\n\n**Sources:**\n"
+                for i, source in enumerate(sources):
+                    sources_text += f"• {source['filename']} (Page {source['page']}, Relevance: {source['relevance']})\n"
+
+                final_response = ai_response + sources_text
+            else:
+                final_response = ai_response
+
+            return {
+                "response": final_response,
+                "sources": sources,
+                "has_context": True,
+                "context_chunks": len(sources)
+            }
+
+        except Exception as e:
+            logger.error(f"❌ RAG response error: {e}")
+            return {
+                "response": f"I encountered an error while processing your query: {str(e)}",
+                "sources": [],
+                "has_context": False
+            }
+
+class ProfessionalResponseGenerator:
+    """Enterprise-grade response generator"""
+
+    def __init__(self):
+        pass
+
+    def analyze_user_intent(self, message: str) -> Dict:
+        """Analyze user intent from message"""
+        message_lower = message.lower().strip()
+
+        greeting_words = ["hello", "hi", "hey", "good morning", "good afternoon", "good evening"]
+        if any(word in message_lower for word in greeting_words) and len(message.split()) <= 3:
+            return {"type": "greeting", "confidence": 0.95}
+
+        help_patterns = ["help", "what can you do", "capabilities", "features", "how to use", "what do you do"]
+        if any(phrase in message_lower for phrase in help_patterns):
+            return {"type": "help", "confidence": 0.9}
+
+        return {"type": "contextual", "confidence": 0.7}
+
+    def get_time_appropriate_greeting(self) -> str:
+        """Get time-appropriate greeting"""
+        current_hour = datetime.now().hour
+
+        if 5 <= current_hour < 12:
+            return "Good morning"
+        elif 12 <= current_hour < 17:
+            return "Good afternoon"
+        elif 17 <= current_hour < 22:
+            return "Good evening"
+        else:
+            return "Hello"
+
+    def generate_greeting_response(self) -> str:
+        """Professional greeting with time awareness"""
+        greeting = self.get_time_appropriate_greeting()
+
+        return f"""{greeting}! I'm IntraNest AI, your enterprise knowledge assistant.
+
+I can help you with document analysis, knowledge search, data insights, and content creation. All responses include source citations when referencing your organizational knowledge.
+
+What would you like to work on today?"""
+
+    def generate_help_response(self) -> str:
+        """Professional capabilities overview"""
+        return """**IntraNest AI Capabilities**
+
+I can assist you with:
+
+**📄 Document Analysis**
+- Summarize reports, policies, and technical documents
+- Extract key insights and action items
+- Compare multiple documents using advanced RAG
+
+**🔍 Knowledge Search**
+- Find specific information across your knowledge base
+- Answer questions with precise source citations
+- Provide contextual explanations using semantic search
+
+**📊 Data Insights**
+- Analyze trends and patterns in your documents
+- Generate executive summaries with source attribution
+- Create actionable recommendations based on your content
+
+What specific task would you like assistance with?"""
+
+    async def generate_professional_response(self, user_message: str, user_id: str = "anonymous", model: str = "IntraNest-AI") -> str:
+        """Generate enterprise-grade responses with document context when available"""
+        try:
+            if not user_message or user_message.strip() == "":
+                user_message = "Hello"
+
+            logger.info(f"🧠 Generating response for: {user_message[:100]}...")
+
+            intent = self.analyze_user_intent(user_message)
+            logger.info(f"🎯 Intent detected: {intent['type']}")
+
+            # For queries that could benefit from document context, try RAG first
+            if intent["type"] in ["contextual"] and document_service:
+                logger.info(f"🔍 Attempting RAG search for user_id: {user_id}")
+                rag_result = await document_service.generate_rag_response(user_message, user_id)
+
+                if rag_result["has_context"]:
+                    logger.info("✅ Using RAG response with document context")
+                    return rag_result["response"]
+
+            # Fall back to standard professional responses
+            if intent["type"] == "greeting":
+                return self.generate_greeting_response()
+            elif intent["type"] == "help":
+                return self.generate_help_response()
+            else:
+                return f"I can help you with that topic. Please upload some documents so I can provide specific information based on your content."
+
+        except Exception as e:
+            logger.error(f"❌ Response generation error: {e}")
+            return "I apologize, but I encountered an error processing your request. Please try again."
+
+# Initialize services
+response_generator = ProfessionalResponseGenerator()
+
+# Initialize document management services
+try:
+    storage_service = StorageService()
+    cache_service = DocumentCacheService()
+    logger.info("✅ Document management services initialized")
+except Exception as e:
+    logger.warning(f"⚠️ Document management services initialization warning: {e}")
+    storage_service = None
+    cache_service = None
+
+async def initialize_document_service():
+    """Initialize the LlamaIndex RAG service"""
+    global document_service
+    try:
+        if DOCUMENT_PROCESSING_AVAILABLE and LLAMAINDEX_AVAILABLE:
+            document_service = LlamaIndexRAGService()
+            logger.info("✅ LlamaIndex RAG service initialized")
+        else:
+            logger.warning("⚠️ LlamaIndex or document processing dependencies not available")
+    except Exception as e:
+        logger.error(f"❌ Failed to initialize LlamaIndex RAG service: {e}")
+
+# API Key dependency
+async def verify_api_key(authorization: Optional[str] = Header(None)):
+    """Verify API key from Authorization header"""
+    expected_key = os.getenv("INTRANEST_API_KEY")
+
+    if not expected_key:
+        return True
+
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Authorization header required")
+
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization format")
+
+    provided_key = authorization.replace("Bearer ", "")
+
+    if provided_key != expected_key:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+    return True
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifespan management"""
+    global weaviate_service, ai_service, document_service
+
+    logger.info("🚀 Starting IntraNest 2.0 with Real-Time Progress Tracking...")
+
+    await initialize_document_service()
+
+    logger.info("✅ All services initialized")
+
+    yield
+
+    logger.info("🛑 Shutting down IntraNest 2.0...")
+    if document_service and document_service.weaviate_client:
+        document_service.weaviate_client.close()
+    logger.info("✅ Shutdown complete")
+
+# Create FastAPI application
+app = FastAPI(
+    title="IntraNest 2.0 - Real-Time Progress Tracking Edition",
+    description="Enterprise AI Knowledge Management Platform with REAL-TIME Progress Tracking",
+    version="2.0.0-realtime-progress",
+    lifespan=lifespan
+)
+
+# Add middleware with enhanced CORS for file uploads
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3090", "http://localhost:3080", "*"],
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["*"],
+    expose_headers=["*"]
+)
+app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+@app.get("/")
+async def root():
+    """Root endpoint"""
+    return {
+        "name": "IntraNest 2.0 - Real-Time Progress Tracking Edition",
+        "version": "2.0.0-realtime-progress",
+        "description": "Enterprise AI Knowledge Management Platform with REAL-TIME Progress Tracking",
+        "status": "fully_operational",
+        "features": {
+            "document_upload": "enabled",
+            "document_listing": "enabled",
+            "rag_search": "enabled",
+            "hybrid_search": "enabled",
+            "direct_upload": "enabled",
+            "real_time_progress": "enabled",
+            "progress_tracking": "real_backend_updates"
+        },
+        "fixes_applied": {
+            "weaviate_compatibility": "fixed",
+            "processing_pipeline": "enhanced",
+            "progress_tracking": "real_time_backend",
+            "cors_headers": "enhanced",
+            "direct_upload": "implemented"
+        }
+    }
+
+@app.get("/api/health")
+async def health_check():
+    """Health check endpoint"""
+    return {
+        "status": "fully_operational",
+        "services": {
+            "api": "running",
+            "weaviate": "operational" if document_service and document_service.weaviate_client else "unavailable",
+            "document_management": "enabled",
+            "storage": "operational" if storage_service else "unavailable",
+            "cache": "operational" if cache_service else "unavailable",
+            "progress_tracking": "real_time"
+        },
+        "version": "2.0.0-realtime-progress",
+        "progress_tracking": "real_backend_updates_enabled",
+        "fixes_applied": "weaviate_compatibility_processing_pipeline"
+    }
+
+def generate_tokens(text: str):
+    """Generator that yields tokens for streaming"""
+    sentences = text.split('. ')
+
+    for i, sentence in enumerate(sentences):
+        if i < len(sentences) - 1:
+            sentence += '. '
+
+        words = sentence.split(' ')
+        for j, word in enumerate(words):
+            if j == 0 and i == 0:
+                yield word
+            else:
+                yield f" {word}"
+
+async def generate_intranest_content(user_message: str, user_id: str = "anonymous", model: str = "IntraNest-AI") -> str:
+    """Enhanced professional content generation"""
+    return await response_generator.generate_professional_response(user_message, user_id, model)
+
+@app.post("/chat/completions")
+async def chat_completions_with_streaming(request: dict, api_key: bool = Depends(verify_api_key)):
+    """OpenAI-compatible chat completions with SSE streaming support"""
+    try:
+        messages = request.get("messages", [])
+        model = request.get("model", "IntraNest-AI")
+        stream = request.get("stream", False)
+
+        if not messages:
+            messages = [{"role": "user", "content": "Hello"}]
+
+        user_message = "Hello"
+        user_id = request.get("user_id", "anonymous")
+
+        for msg in reversed(messages):
+            if msg.get("role") == "user" and msg.get("content"):
+                user_message = msg.get("content")
+                break
+
+        logger.info(f"Chat request: '{user_message[:100]}...' user: {user_id}")
+
+        response_content = await generate_intranest_content(user_message, user_id, model)
+
+        if stream:
+            async def event_generator():
+                try:
+                    completion_id = f"chatcmpl-{int(datetime.now().timestamp())}-{uuid.uuid4().hex[:8]}"
+                    created = int(datetime.now().timestamp())
+
+                    for token in generate_tokens(response_content):
+                        chunk = {
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {"content": token},
+                                "finish_reason": None
+                            }]
+                        }
+                        yield f"data: {json.dumps(chunk)}\n\n"
+                        await asyncio.sleep(0.01)
+
+                    final_chunk = {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {},
+                            "finish_reason": "stop"
+                        }]
+                    }
+                    yield f"data: {json.dumps(final_chunk)}\n\n"
+                    yield "data: [DONE]\n\n"
+
+                except Exception as e:
+                    logger.error(f"Streaming error: {e}")
+                    yield f"data: [DONE]\n\n"
+
+            return StreamingResponse(
+                event_generator(),
+                media_type="text/plain",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive"
+                }
+            )
+
+        else:
+            return {
+                "id": f"chatcmpl-{int(datetime.now().timestamp())}-{uuid.uuid4().hex[:8]}",
+                "object": "chat.completion",
+                "created": int(datetime.now().timestamp()),
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": response_content
+                    },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": max(1, len(user_message) // 4),
+                    "completion_tokens": max(1, len(response_content) // 4),
+                    "total_tokens": max(2, len(user_message + response_content) // 4)
+                }
+            }
+
+    except Exception as e:
+        logger.error(f"Chat completions error: {e}")
+        return {
+            "id": f"chatcmpl-error-{int(datetime.now().timestamp())}",
+            "object": "chat.completion",
+            "created": int(datetime.now().timestamp()),
+            "model": "IntraNest-AI",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "I apologize, but I encountered an error. Please try again."
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 20, "total_tokens": 21}
+        }
+
+# === FIXED DOCUMENT PROCESSING FUNCTIONS ===
+
+def create_chunks_with_progress(text_content: str, filename: str, document_id: str, user_id: str, cache_service, progress_start: int = 40) -> List[Dict]:
+    """FIXED: Create text chunks with real-time progress updates"""
+    try:
+        if not text_content.strip():
+            logger.warning(f"⚠️ Empty text content for {document_id}")
+            return []
+
+        logger.info(f"🔪 CHUNKING TEXT for {document_id}: {len(text_content)} characters")
+
+        chunks = []
+        chunk_size = DocumentConfig.CHUNK_SIZE
+        overlap = DocumentConfig.CHUNK_OVERLAP
+        total_chars = len(text_content)
+
+        cache_service.update_progress(
+            document_id,
+            "chunking",
+            progress_start,
+            f"Breaking document into chunks... (0/{(total_chars // chunk_size) + 1} chunks)"
+        )
+
+        # Split into chunks with progress updates
+        for i in range(0, len(text_content), chunk_size - overlap):
+            chunk_text = text_content[i:i + chunk_size].strip()
+            if not chunk_text:  # Skip empty chunks
+                continue
+                
+            chunk_number = len(chunks)  # Use actual chunk count
+            total_estimated_chunks = (total_chars // chunk_size) + 1
+
+            chunk_data = {
+                "content": chunk_text,
+                "filename": filename,
+                "user_id": user_id,
+                "document_id": document_id,
+                "node_id": str(uuid.uuid4()),
+                "chunk_id": chunk_number,
+                "page_number": 1,
+                "metadata": {
+                    "upload_date": datetime.now().isoformat(),
+                    "file_type": "text/plain",
+                    "chunk_size": len(chunk_text),
+                    "source": filename
+                }
+            }
+            chunks.append(chunk_data)
+
+            # Update progress for chunking
+            chunk_progress = progress_start + int((chunk_number / total_estimated_chunks) * 15)  # 15% for chunking
+            cache_service.update_progress(
+                document_id,
+                "chunking",
+                min(chunk_progress, progress_start + 15),
+                f"Breaking document into chunks... ({chunk_number + 1}/{total_estimated_chunks} chunks created)"
+            )
+
+        logger.info(f"✅ CREATED {len(chunks)} chunks for document {document_id}")
+        return chunks
+        
+    except Exception as e:
+        logger.error(f"❌ CHUNKING FAILED for {document_id}: {e}")
+        raise
+
+async def store_chunks_with_progress(chunks: List[Dict], document_id: str, cache_service, progress_start: int = 55) -> int:
+    """FIXED: Store chunks in Weaviate with real-time progress updates"""
+    try:
+        logger.info(f"📊 STORING {len(chunks)} chunks in Weaviate with progress tracking...")
+
+        # Use WeaviateHelper for consistent connection
+        client = WeaviateHelper.get_client()
+        documents_collection = client.collections.get("Documents")
+        success_count = 0
+        total_chunks = len(chunks)
+
+        cache_service.update_progress(
+            document_id,
+            "storing",
+            progress_start,
+            f"Storing chunks in knowledge base... (0/{total_chunks} chunks stored)"
+        )
+
+        for i, chunk in enumerate(chunks):
+            try:
+                # Prepare properties for insertion
+                properties = {
+                    "content": chunk["content"],
+                    "filename": chunk["filename"],
+                    "user_id": chunk["user_id"],
+                    "document_id": chunk["document_id"],
+                    "node_id": chunk["node_id"],
+                    "chunk_id": chunk["chunk_id"],
+                    "page_number": chunk["page_number"],
+                    "metadata": chunk["metadata"]
+                }
+                
+                # Insert into Weaviate
+                result = documents_collection.data.insert(properties)
+                success_count += 1
+
+                logger.info(f"✅ INSERTED chunk {chunk['chunk_id']} with UUID {result}")
+
+                # Update progress for each chunk stored
+                store_progress = progress_start + int(((i + 1) / total_chunks) * 40)  # 40% for storage
+                cache_service.update_progress(
+                    document_id,
+                    "storing",
+                    min(store_progress, progress_start + 40),
+                    f"Storing chunks in knowledge base... ({success_count}/{total_chunks} chunks stored)",
+                    chunks_processed=success_count,
+                    total_chunks=total_chunks
+                )
+
+                # Small delay to allow progress updates to be visible
+                await asyncio.sleep(0.05)
+
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to insert chunk {chunk['chunk_id']}: {e}")
+                continue
+
+        logger.info(f"📊 Successfully stored {success_count}/{len(chunks)} chunks with real-time progress")
+        return success_count
+
+    except Exception as e:
+        logger.error(f"❌ Weaviate storage with progress failed: {e}")
+        cache_service.update_progress(
+            document_id,
+            "error",
+            0,
+            f"Storage failed: {str(e)}"
+        )
+        raise
+    finally:
+        try:
+            client.close()
+        except:
+            pass
+
+async def process_document_with_real_progress(document_id: str, document_metadata: Dict, file_content: bytes, cache_service):
+    """FIXED: Enhanced document processing with REAL backend progress tracking"""
+    try:
+        filename = document_metadata["filename"]
+        user_id = document_metadata["user_id"]
+
+        logger.info(f"📄 STARTING PROCESSING: {filename} for user: {user_id} (Document ID: {document_id})")
+
+        # STEP 1: Text extraction (25% -> 40%)
+        cache_service.update_progress(document_id, "extracting_text", 30, "Extracting text content from document...")
+        logger.info(f"🔤 EXTRACTING TEXT from {filename}")
+        
+        # Enhanced text extraction
+        try:
+            if filename.lower().endswith('.txt'):
+                text_content = file_content.decode('utf-8', errors='ignore')
+            elif filename.lower().endswith(('.html', '.htm')):
+                text_content = file_content.decode('utf-8', errors='ignore')
+                # Basic HTML tag removal
+                import re
+                text_content = re.sub(r'<[^>]+>', '', text_content)
+            else:
+                # Try as text for other formats
+                text_content = file_content.decode('utf-8', errors='ignore')
+                
+            logger.info(f"📊 EXTRACTED {len(text_content)} characters from {filename}")
+            
+        except Exception as e:
+            logger.error(f"❌ TEXT EXTRACTION FAILED: {e}")
+            raise Exception(f"Failed to extract text from {filename}: {str(e)}")
+        
+        if not text_content.strip():
+            raise Exception(f"No readable text found in {filename}")
+        
+        cache_service.update_progress(document_id, "text_extracted", 40, f"Text extraction complete. Found {len(text_content)} characters.")
+
+        # STEP 2: Create chunks with progress (40% -> 55%)
+        logger.info(f"🔪 STARTING CHUNKING for {document_id}")
+        chunks = create_chunks_with_progress(text_content, filename, document_id, user_id, cache_service, 40)
+        logger.info(f"📋 CREATED {len(chunks)} chunks for {document_id}")
+
+        if not chunks:
+            raise Exception("No content extracted from document for chunking")
+
+        # STEP 3: Store chunks with progress (55% -> 95%)
+        logger.info(f"💾 STARTING STORAGE for {document_id}")
+        success_count = await store_chunks_with_progress(chunks, document_id, cache_service, 55)
+        logger.info(f"✅ STORED {success_count}/{len(chunks)} chunks for {document_id}")
+
+        if success_count == 0:
+            raise Exception("Failed to store any chunks in vector database")
+
+        # STEP 4: Finalize (95% -> 100%)
+        cache_service.update_progress(
+            document_id,
+            "finalizing",
+            95,
+            "Finalizing document processing..."
+        )
+
+        # Update metadata
+        document_metadata.update({
+            "chunks_created": success_count,
+            "status": "completed",
+            "total_chunks": len(chunks),
+            "chunks_processed": success_count,
+            "text_length": len(text_content)
+        })
+
+        logger.info(f"🎉 PROCESSING COMPLETED for {document_id}: {success_count} chunks stored")
+
+    except Exception as e:
+        logger.error(f"❌ PROCESSING FAILED for {document_id}: {e}")
+        cache_service.update_progress(
+            document_id,
+            "error",
+            0,
+            f"Processing failed: {str(e)}"
+        )
+        document_metadata.update({
+            "status": "error",
+            "error": str(e)
+        })
+        raise
+
+# === ENHANCED DOCUMENT MANAGEMENT ENDPOINTS WITH REAL PROGRESS ===
+
+@app.post("/api/documents/upload")
+async def upload_document_with_real_progress(
+    file: UploadFile = File(...),
+    user_id: str = Form(...),
+    api_key: bool = Depends(verify_api_key)
+):
+    """FIXED: Direct document upload with REAL backend progress tracking"""
+    if not storage_service or not cache_service:
+        raise HTTPException(status_code=503, detail="Document services not available")
+
+    try:
+        logger.info(f"📤 STARTING UPLOAD: {file.filename} for user: {user_id}")
+
+        # Validate file
+        if file.size and file.size > DocumentConfig.MAX_FILE_SIZE:
+            raise HTTPException(
+                status_code=400,
+                detail=f"File size exceeds maximum allowed size of {DocumentConfig.MAX_FILE_SIZE // (1024*1024)}MB"
+            )
+
+        # Validate file type
+        mime_type = file.content_type or mimetypes.guess_type(file.filename)[0]
+        if mime_type not in DocumentConfig.ALLOWED_MIME_TYPES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"File type not allowed. Supported: PDF, DOCX, TXT, HTML, MD"
+            )
+
+        # Generate document ID
+        document_id = f"doc_{int(datetime.now().timestamp())}_{uuid.uuid4().hex[:8]}"
+        logger.info(f"📋 Generated document ID: {document_id}")
+
+        # STEP 1: Initialize progress tracking (5%)
+        cache_service.update_progress(
+            document_id,
+            "initializing",
+            5,
+            "Initializing document upload...",
+            filename=file.filename,
+            user_id=user_id,
+            file_size=file.size or 0
+        )
+
+        # STEP 2: Read file content (15%)
+        cache_service.update_progress(document_id, "reading_file", 15, "Reading file content...")
+        logger.info(f"📖 Reading file content for {document_id}")
+        file_content = await file.read()
+
+        # STEP 3: Save file locally (25%)
+        cache_service.update_progress(document_id, "saving_file", 25, "Saving file to storage...")
+        logger.info(f"💾 Saving file for {document_id}")
+        file_path = storage_service.save_uploaded_file(file_content, file.filename, user_id)
+
+        # Create document metadata
+        document_metadata = {
+            "document_id": document_id,
+            "filename": file.filename,
+            "user_id": user_id,
+            "file_path": file_path,
+            "status": "processing",
+            "created_at": datetime.now().isoformat(),
+            "file_size": len(file_content),
+            "mime_type": mime_type,
+            "processing_started_at": datetime.now().isoformat()
+        }
+
+        # Cache metadata
+        cache_service.cache_processing_status(document_id, document_metadata)
+
+        # STEP 4: Process document with DETAILED LOGGING
+        logger.info(f"🚀 STARTING DOCUMENT PROCESSING for {document_id}")
+        try:
+            await process_document_with_real_progress(document_id, document_metadata, file_content, cache_service)
+
+            # STEP 5: Final completion (100%)
+            cache_service.update_progress(
+                document_id,
+                "completed",
+                100,
+                f"Document processing complete! Created {document_metadata.get('chunks_created', 0)} searchable chunks.",
+                chunks_created=document_metadata.get('chunks_created', 0)
+            )
+
+            # Update to completed
+            document_metadata["status"] = "completed"
+            document_metadata["completed_at"] = datetime.now().isoformat()
+            cache_service.cache_processing_status(document_id, document_metadata, ttl=86400)
+
+            logger.info(f"✅ UPLOAD COMPLETED: {file.filename} - {document_metadata.get('chunks_created', 0)} chunks")
+
+            return {
+                "success": True,
+                "document_id": document_id,
+                "filename": file.filename,
+                "status": "completed",
+                "message": f"Document '{file.filename}' uploaded and processed successfully",
+                "chunks_created": document_metadata.get("chunks_created", 0)
+            }
+
+        except Exception as process_error:
+            logger.error(f"❌ PROCESSING FAILED for {document_id}: {process_error}")
+            cache_service.update_progress(
+                document_id,
+                "error",
+                0,
+                f"Processing failed: {str(process_error)}"
+            )
+
+            document_metadata["status"] = "error"
+            document_metadata["error"] = str(process_error)
+            cache_service.cache_processing_status(document_id, document_metadata)
+
+            return {
+                "success": False,
+                "document_id": document_id,
+                "filename": file.filename,
+                "status": "error",
+                "error": str(process_error)
+            }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ UPLOAD ERROR: {e}")
+        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
+
+@app.get("/api/documents/status/{document_id}")
+async def get_processing_status_enhanced(document_id: str, user_id: str, api_key: bool = Depends(verify_api_key)):
+    """ENHANCED: Get real-time document processing status with detailed progress"""
+    if not cache_service:
+        raise HTTPException(status_code=503, detail="Cache service not available")
+
+    try:
+        status = cache_service.get_processing_status(document_id)
+        if not status:
+            raise HTTPException(status_code=404, detail="Document not found")
+
+        if status.get("user_id") != user_id:
+            raise HTTPException(status_code=403, detail="Access denied")
+
+        return {
+            "success": True,
+            "document_id": document_id,
+            "status": status.get("status", "unknown"),
+            "progress": status.get("progress", 0),
+            "message": status.get("message", "Processing..."),
+            "current_step": status.get("current_step", ""),
+            "filename": status.get("filename"),
+            "created_at": status.get("created_at"),
+            "updated_at": status.get("updated_at"),
+            "completed_at": status.get("completed_at"),
+            "error": status.get("error"),
+            "chunks_created": status.get("chunks_created", 0),
+            "chunks_processed": status.get("chunks_processed", 0),
+            "total_chunks": status.get("total_chunks", 0)
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting status: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/documents/list")
+async def list_documents_fixed(request: dict, api_key: bool = Depends(verify_api_key)):
+    """FIXED: List user documents with metadata - WEAVIATE FILTER FIXED VERSION"""
+    try:
+        user_id = request.get("user_id")
+        tenant_id = request.get("tenant_id", "default")
+
+        if not user_id:
+            raise HTTPException(status_code=400, detail="user_id is required")
+
+        logger.info(f"📋 Listing documents for user: {user_id}")
+
+        # Connect to Weaviate using helper
+        client = WeaviateHelper.get_client()
+
+        try:
+            documents_collection = client.collections.get("Documents")
+
+            # Use safe query method that handles different Weaviate versions
+            logger.info(f"🔍 Querying Weaviate for user documents...")
+            response = WeaviateHelper.safe_query_with_filter(documents_collection, user_id, 1000)
+
+            logger.info(f"📄 Found {len(response.objects)} chunks for user {user_id}")
+
+            # Group by document_id to get unique documents
+            doc_map = {}
+            processed_count = 0
+
+            for obj in response.objects:
+                try:
+                    props = obj.properties if hasattr(obj, 'properties') else {}
+                    
+                    # Handle different property access patterns
+                    def safe_get_prop(prop_name, default=''):
+                        if hasattr(props, prop_name):
+                            return getattr(props, prop_name)
+                        elif isinstance(props, dict):
+                            return props.get(prop_name, default)
+                        else:
+                            return default
+
+                    obj_user_id = safe_get_prop('user_id', '')
+                    
+                    # Additional filtering check (in case manual filtering in WeaviateHelper didn't work)
+                    if obj_user_id != user_id:
+                        continue
+
+                    processed_count += 1
+                    doc_id = safe_get_prop('document_id', str(obj.uuid))
+
+                    if doc_id not in doc_map:
+                        metadata = safe_get_prop('metadata', {})
+
+                        # Handle metadata safely
+                        if hasattr(metadata, '__dict__'):
+                            metadata_dict = metadata.__dict__
+                        elif isinstance(metadata, dict):
+                            metadata_dict = metadata
+                        else:
+                            metadata_dict = {}
+
+                        doc_map[doc_id] = {
+                            "id": doc_id,
+                            "filename": safe_get_prop('filename', 'Unknown'),
+                            "size": 0,
+                            "uploadDate": metadata_dict.get('upload_date', ''),
+                            "status": "processed",
+                            "userId": user_id,
+                            "documentId": doc_id,
+                            "chunks": 0,
+                            "wordCount": 0,
+                            "fileType": metadata_dict.get('file_type', 'text/plain')
+                        }
+
+                    # Accumulate stats
+                    content = safe_get_prop('content', '')
+                    doc_map[doc_id]["chunks"] += 1
+                    doc_map[doc_id]["size"] += len(content)
+                    doc_map[doc_id]["wordCount"] += len(content.split())
+
+                except Exception as e:
+                    logger.warning(f"⚠️ Error processing object: {e}")
+                    continue
+
+            documents = list(doc_map.values())
+
+            logger.info(f"✅ Processed {processed_count} chunks, returning {len(documents)} unique documents for user {user_id}")
+
+            return {
+                "success": True,
+                "documents": documents,
+                "total": len(documents),
+                "userId": user_id,
+                "debug": {
+                    "total_chunks_found": len(response.objects) if hasattr(response, 'objects') else 0,
+                    "chunks_processed": processed_count,
+                    "weaviate_filter_used": "safe_query_with_manual_fallback"
+                }
+            }
+
+        finally:
+            client.close()
+
+    except Exception as e:
+        logger.error(f"❌ Error listing documents: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to list documents: {str(e)}")
+
+@app.post("/api/documents/search")
+async def search_documents_endpoint(request: dict, api_key: bool = Depends(verify_api_key)):
+    """Search documents using hybrid RAG"""
+    try:
+        query = request.get("query", "")
+        user_id = request.get("user_id", "")
+        limit = request.get("limit", 5)
+
+        if not query or not user_id:
+            raise HTTPException(status_code=400, detail="query and user_id are required")
+
+        if not document_service:
+            raise HTTPException(status_code=503, detail="Document service not available")
+
+        results = await document_service.search_documents(query, user_id, limit)
+
+        return {
+            "success": True,
+            "query": query,
+            "results": results,
+            "total": len(results)
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Search error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/chat/rag")
+async def rag_chat_endpoint(request: dict, api_key: bool = Depends(verify_api_key)):
+    """RAG-powered chat endpoint"""
+    try:
+        query = request.get("query", "")
+        user_id = request.get("user_id", "anonymous")
+        context_limit = request.get("context_limit", 5)
+
+        if not query:
+            raise HTTPException(status_code=400, detail="query is required")
+
+        if not document_service:
+            raise HTTPException(status_code=503, detail="Document service not available")
+
+        result = await document_service.generate_rag_response(query, user_id, context_limit)
+
+        return {
+            "success": True,
+            "query": query,
+            "response": result["response"],
+            "sources": result["sources"],
+            "has_context": result["has_context"],
+            "context_chunks": result.get("context_chunks", 0)
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"RAG chat error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8001)

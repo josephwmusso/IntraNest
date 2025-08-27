@@ -1,0 +1,6 @@
+Collecting PyPDF2
+  Downloading pypdf2-3.0.1-py3-none-any.whl.metadata (6.8 kB)
+Requirement already satisfied: typing_extensions>=3.10.0.0 in ./venv/lib/python3.9/site-packages (from PyPDF2) (4.14.1)
+Downloading pypdf2-3.0.1-py3-none-any.whl (232 kB)
+Installing collected packages: PyPDF2
+Successfully installed PyPDF2-3.0.1

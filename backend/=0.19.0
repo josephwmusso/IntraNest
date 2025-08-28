@@ -1,0 +1,11 @@
+Requirement already satisfied: aiosqlite in ./venv/lib/python3.9/site-packages (0.21.0)
+Requirement already satisfied: redis[hiredis] in ./venv/lib/python3.9/site-packages (5.0.1)
+Requirement already satisfied: sqlalchemy[asyncio] in ./venv/lib/python3.9/site-packages (2.0.42)
+Requirement already satisfied: async-timeout>=4.0.2 in ./venv/lib/python3.9/site-packages (from redis[hiredis]) (4.0.3)
+Collecting hiredis>=1.0.0 (from redis[hiredis])
+  Downloading hiredis-3.2.1-cp39-cp39-manylinux_2_17_x86_64.manylinux2014_x86_64.whl.metadata (7.2 kB)
+Requirement already satisfied: greenlet>=1 in ./venv/lib/python3.9/site-packages (from sqlalchemy[asyncio]) (3.2.3)
+Requirement already satisfied: typing-extensions>=4.6.0 in ./venv/lib/python3.9/site-packages (from sqlalchemy[asyncio]) (4.14.1)
+Downloading hiredis-3.2.1-cp39-cp39-manylinux_2_17_x86_64.manylinux2014_x86_64.whl (168 kB)
+Installing collected packages: hiredis
+Successfully installed hiredis-3.2.1

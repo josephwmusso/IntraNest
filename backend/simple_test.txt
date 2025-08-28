@@ -1,0 +1,1 @@
+IntraNest is an enterprise AI knowledge management platform with document analysis, semantic search, and RAG integration capabilities.

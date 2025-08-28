@@ -1,0 +1,12 @@
+Collecting markdown
+  Downloading markdown-3.8.2-py3-none-any.whl.metadata (5.1 kB)
+Collecting importlib-metadata>=4.4 (from markdown)
+  Downloading importlib_metadata-8.7.0-py3-none-any.whl.metadata (4.8 kB)
+Collecting zipp>=3.20 (from importlib-metadata>=4.4->markdown)
+  Downloading zipp-3.23.0-py3-none-any.whl.metadata (3.6 kB)
+Downloading markdown-3.8.2-py3-none-any.whl (106 kB)
+Downloading importlib_metadata-8.7.0-py3-none-any.whl (27 kB)
+Downloading zipp-3.23.0-py3-none-any.whl (10 kB)
+Installing collected packages: zipp, importlib-metadata, markdown
+
+Successfully installed importlib-metadata-8.7.0 markdown-3.8.2 zipp-3.23.0
